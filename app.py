@@ -1,376 +1,269 @@
-# app.py — ValueVault Props API (props-first, per-event odds fix)
+# app.py — ValueVault Props API (PROPS-first)
+# Run locally: uvicorn app:app --host 0.0.0.0 --port 8000
+
+import os
+import time
+import json
+import requests
+from typing import List, Optional, Union, Tuple, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional, Tuple
-import requests
+from pydantic import BaseModel
 from datetime import datetime, timezone
 
-# -----------------------------------------------------------------------------
-# App & CORS
-# -----------------------------------------------------------------------------
+API_NAME = "ValueVault Props API"
+API_VERSION = "0.1.0"
 
-app = FastAPI(
-    title="ValueVault Props API",
-    version="0.1.0",
-    description="Props-first backend that pulls player props via per-event endpoints"
-)
+# ---------------------------
+# FastAPI app & CORS
+# ---------------------------
+app = FastAPI(title=f"{API_NAME} (PROPS-first)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down to your domains if you want
+    allow_origins=["*"],  # viewer.html file, localhost, etc.
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Odds API helpers (per-event props)
-# -----------------------------------------------------------------------------
-
-ODDS_BASE = "https://api.the-odds-api.com/v4"
-
-
-def _get_today_event_ids(api_key: str, sport_key: str, tz: str = "America/New_York") -> List[str]:
-    """
-    Fetch today's event IDs for a sport.
-    Uses /sports/{sport}/events (NOT the odds endpoint).
-    """
-    url = f"{ODDS_BASE}/sports/{sport_key}/events"
-    params = {
-        "apiKey": api_key,
-        "dateFormat": "iso",
-        "daysFrom": 0,   # today
-        "daysTo": 0,     # today
-        "tz": tz,
-    }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    events = r.json() or []
-    return [e["id"] for e in events if isinstance(e, dict) and "id" in e]
-
-
-def _get_props_for_event(
-    api_key: str,
-    sport_key: str,
-    event_id: str,
-    markets: List[str],
-    regions: str,
-    books: List[str]
-) -> Dict[str, Any]:
-    """
-    Fetch player-prop odds for a single event using:
-    /sports/{sport}/events/{eventId}/odds?markets=...&regions=...
-    """
-    url = f"{ODDS_BASE}/sports/{sport_key}/events/{event_id}/odds"
-    params = {
-        "apiKey": api_key,
-        "markets": ",".join(markets),
-        "regions": regions,
-        "oddsFormat": "american",
-        "dateFormat": "iso",
-    }
-    if books:
-        params["bookmakers"] = ",".join(books)
-
-    r = requests.get(url, params=params, timeout=30)
-    if r.status_code == 404:
-        return {}
-    r.raise_for_status()
-    return r.json()
-
-
-def _normalize_game_props(game: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Flatten a single event's props into rows ready for sheets / modeling.
-    """
-    rows: List[Dict[str, Any]] = []
-    if not isinstance(game, dict):
-        return rows
-
-    event_id = game.get("id")
-    commence = game.get("commence_time")
-    home = game.get("home_team")
-    away = game.get("away_team")
-
-    for bm in game.get("bookmakers", []) or []:
-        book = bm.get("title")
-        for mkt in bm.get("markets", []) or []:
-            market_key = mkt.get("key")
-            for out in mkt.get("outcomes", []) or []:
-                rows.append({
-                    "event_id": event_id,
-                    "start_iso": commence,
-                    "home": home,
-                    "away": away,
-                    "book": book,
-                    "market": market_key,
-                    "name": out.get("description") or out.get("name"),  # player name or label
-                    "bet_side": out.get("name"),                        # Over/Under/Yes/No
-                    "line": out.get("point"),
-                    "odds": out.get("price"),
-                })
-    return rows
-
-
-def fetch_props_raw_for_sport(
-    api_key: str,
-    sport_key: str,
-    markets: List[str],
-    books: List[str],
-    regions: str,
-    tz: str = "America/New_York"
-) -> List[Dict[str, Any]]:
-    """
-    Gather props across today's events for the given sport.
-    """
-    rows: List[Dict[str, Any]] = []
-    event_ids = _get_today_event_ids(api_key, sport_key, tz)
-    for eid in event_ids:
-        data = _get_props_for_event(api_key, sport_key, eid, markets, regions, books)
-        if not data:
-            continue
-        # per-event endpoint can return a dict (single game) or list (rare)
-        games = [data] if isinstance(data, dict) else data
-        for g in games:
-            rows.extend(_normalize_game_props(g))
-    return rows
-
-
-# -----------------------------------------------------------------------------
-# Pydantic models (requests / responses)
-# -----------------------------------------------------------------------------
+# ---------------------------
+# Models & helpers
+# ---------------------------
 
 class PropsRawReq(BaseModel):
-    api_key: str = Field(..., description="The Odds API key")
-    sports: List[str] = Field(..., description="e.g., ['baseball_mlb']")
-    markets: List[str] = Field(..., description="e.g., ['batter_hits','batter_total_bases']")
-    books: List[str] = Field(default_factory=list, description="e.g., ['fanduel','draftkings']")
-    regions: str = Field("us", description="Odds API regions, e.g., 'us'")
-    tz: str = Field("America/New_York", description="Time zone for event listing")
+    # If provided, overrides the env var ODDS_API_KEY
+    api_key: Optional[str] = None
+
+    # Accept either a string or a list in the request body
+    sports: Union[str, List[str]]
+    markets: Union[str, List[str]]
+    books: Union[str, List[str]]
+    regions: Union[str, List[str]] = "us"
+
+    # Optional knobs (safe defaults)
+    odds_format: str = "american"      # "american" | "decimal"
+    days_from: int = 2                  # how far ahead to scan events
+    cache_ttl_minutes: int = 2          # in-memory cache TTL
+    force: bool = False                 # ignore cache on this request
 
 
-class PropsRawResp(BaseModel):
-    rows: List[Dict[str, Any]]
-    meta: Dict[str, Any]
+def _as_list(v: Union[str, List[str], None]) -> List[str]:
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
 
 
-class ModelReq(BaseModel):
-    rows: List[Dict[str, Any]]  # input rows from /props/raw
-    # Optional knobs for modeling (simple baseline)
-    min_odds: Optional[int] = None  # e.g., exclude odds shorter than -140, etc.
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-class ParlayReq(BaseModel):
-    rows: List[Dict[str, Any]]        # rows with at least event_id, name, market, odds, book
-    parlay_size: int = 3              # how many legs
-    max_same_game: int = 1            # prevent too many legs from same event_id
-    max_per_player: int = 1           # prevent stacking the same player
-    distinct_markets_only: bool = True
+# very small in-memory cache
+_cache: Dict[Tuple, Dict[str, Any]] = {}  # key -> {"ts": float, "payload": dict}
 
 
-class ParlayResp(BaseModel):
-    picks: List[Dict[str, Any]]
-    meta: Dict[str, Any]
-
-
-class DubReq(BaseModel):
-    picks: List[Dict[str, Any]]
-    header: Optional[str] = "Tonight's Props"
-    footer: Optional[str] = "#ValueVault"
-
-
-# -----------------------------------------------------------------------------
-# Utility: American odds -> implied probability (no vig removal)
-# -----------------------------------------------------------------------------
-
-def american_to_prob(odds: Optional[int]) -> Optional[float]:
-    if odds is None:
+def _cache_get(key: Tuple, ttl_minutes: int) -> Optional[dict]:
+    if ttl_minutes <= 0:
         return None
-    try:
-        o = int(odds)
-    except Exception:
+    item = _cache.get(key)
+    if not item:
         return None
-    if o > 0:
-        return 100.0 / (o + 100.0)
-    else:
-        return (-o) / ((-o) + 100.0)
+    if (time.time() - item["ts"]) <= ttl_minutes * 60:
+        return item["payload"]
+    return None
 
 
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
+def _cache_set(key: Tuple, payload: dict) -> None:
+    _cache[key] = {"ts": time.time(), "payload": payload}
+
+
+# ---------------------------
+# Root (health)
+# ---------------------------
 
 @app.get("/")
 def root():
     return {
-        "name": "ValueVault Props API",
-        "version": app.version,
-        "time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "health": "ok"
+        "name": API_NAME,
+        "version": API_VERSION,
+        "time_utc": _now_utc_iso(),
+        "health": "ok",
     }
 
 
-@app.post("/props/raw", response_model=PropsRawResp)
+# ---------------------------
+# Core: /props/raw
+# ---------------------------
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+
+@app.post("/props/raw")
 def props_raw(req: PropsRawReq):
     """
-    Pull player prop markets using the **per-event** endpoint.
-    Fixes INVALID_MARKET that happens on the game-odds endpoint.
+    Pull player prop markets using the per-event endpoint to avoid INVALID_MARKET.
+    Accepts single strings or CSV-like lists in JSON arrays.
     """
-    try:
-        all_rows: List[Dict[str, Any]] = []
-        for sport_key in req.sports:
-            rows = fetch_props_raw_for_sport(
-                api_key=req.api_key,
-                sport_key=sport_key,
-                markets=req.markets,
-                books=req.books,
-                regions=req.regions,
-                tz=req.tz,
-            )
-            # tag sport so downstream filters are easy
-            for r in rows:
-                r["sport_key"] = sport_key
-            all_rows.extend(rows)
 
-        return {
-            "rows": all_rows,
-            "meta": {
-                "count": len(all_rows),
-                "sports": req.sports,
-                "markets": req.markets,
-                "books": req.books,
-                "regions": req.regions,
-            },
+    # 1) API key resolution
+    odds_api_key = req.api_key or os.getenv("ODDS_API_KEY")
+    if not odds_api_key:
+        raise HTTPException(status_code=400, detail="No Odds API key provided or configured (ODDS_API_KEY).")
+
+    sports = _as_list(req.sports)
+    markets = _as_list(req.markets)
+    books = [b.lower() for b in _as_list(req.books)]
+    regions = [r.lower() for r in _as_list(req.regions)]
+    if not sports or not markets or not books or not regions:
+        raise HTTPException(status_code=422, detail="sports, markets, books, and regions are required (string or list).")
+
+    # 2) Cache key & lookup
+    cache_key = (
+        tuple(sorted(sports)),
+        tuple(sorted(markets)),
+        tuple(sorted(books)),
+        tuple(sorted(regions)),
+        req.odds_format,
+        req.days_from,
+    )
+    if not req.force:
+        cached = _cache_get(cache_key, req.cache_ttl_minutes)
+        if cached:
+            return cached
+
+    # 3) Fetch events per sport, then per-event odds with markets filter
+    rows: List[dict] = []
+    meta: dict = {"sports": sports, "markets": markets, "books": books, "regions": regions}
+
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json"})
+    timeout = (10, 30)  # connect, read
+
+    # Helper: ensure we only keep requested books
+    def _keep_book(key: str) -> bool:
+        return key.lower() in books
+
+    for sport in sports:
+        # 3a) list events for the sport
+        # Docs: GET /v4/sports/{sport}/events?apiKey=...&daysFrom=N
+        events_url = f"{ODDS_API_BASE}/sports/{sport}/events"
+        params_events = {
+            "apiKey": odds_api_key,
+            "daysFrom": req.days_from,
         }
-    except requests.HTTPError as e:
-        # Bubble up Odds API errors cleanly
-        detail = getattr(e.response, "text", str(e))
-        raise HTTPException(status_code=e.response.status_code if e.response else 502, detail=detail)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        try:
+            ev_resp = session.get(events_url, params=params_events, timeout=timeout)
+            if ev_resp.status_code != 200:
+                raise HTTPException(status_code=ev_resp.status_code,
+                                    detail=f"Events fetch failed for {sport}: {ev_resp.text}")
+            events = ev_resp.json() or []
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"Events fetch error for {sport}: {e}")
 
+        # 3b) for each event, pull per-event odds with requested player markets
+        for ev in events:
+            event_id = ev.get("id")
+            if not event_id:
+                # Older accounts sometimes use 'id' or 'eventId'; handle defensively
+                event_id = ev.get("eventId")
+            if not event_id:
+                continue
+
+            odds_url = f"{ODDS_API_BASE}/sports/{sport}/events/{event_id}/odds"
+            params_odds = {
+                "apiKey": odds_api_key,
+                "regions": ",".join(regions),
+                "markets": ",".join(markets),
+                "oddsFormat": req.odds_format,
+            }
+            try:
+                od_resp = session.get(odds_url, params=params_odds, timeout=timeout)
+                if od_resp.status_code == 404:
+                    # event vanished or unavailable—skip quietly
+                    continue
+                if od_resp.status_code != 200:
+                    # don't crash whole batch—record soft error in meta and continue
+                    meta.setdefault("errors", []).append({
+                        "sport": sport,
+                        "event_id": event_id,
+                        "status": od_resp.status_code,
+                        "body": od_resp.text[:300],
+                    })
+                    continue
+                od = od_resp.json()
+            except requests.RequestException as e:
+                meta.setdefault("errors", []).append({
+                    "sport": sport,
+                    "event_id": event_id,
+                    "error": str(e),
+                })
+                continue
+
+            # Expected schema (abridged):
+            # {
+            #   "id": "...",
+            #   "commence_time": "2025-09-05T18:21:00Z",
+            #   "home_team": "...", "away_team": "...",
+            #   "bookmakers": [
+            #     {"key":"fanduel","title":"FanDuel","markets":[
+            #        {"key":"batter_hits","outcomes":[
+            #           {"name":"Over","point":1.5,"price":-110,"description":"Seiya Suzuki"},
+            #           {"name":"Under","point":1.5,"price":-115,"description":"Seiya Suzuki"}
+            #        ]}, ...
+            #     ]}
+            #   ]
+            # }
+
+            start_iso = od.get("commence_time") or ev.get("commence_time")
+            home = od.get("home_team") or ev.get("home_team")
+            away = od.get("away_team") or ev.get("away_team")
+
+            for bm in od.get("bookmakers", []):
+                if not _keep_book(bm.get("key", "")):
+                    continue
+
+                book_key = bm.get("key")
+                for m in bm.get("markets", []):
+                    market_key = m.get("key")
+                    for out in m.get("outcomes", []):
+                        # Player name usually in "description" for player props
+                        player_name = out.get("description") or out.get("participant") or out.get("name")
+                        side = out.get("name")  # "Over", "Under", "Yes", "No"
+                        line = out.get("point")
+                        odds = out.get("price")  # american odds when oddsFormat=american
+
+                        row = {
+                            "start_iso": start_iso,
+                            "sport_key": sport,
+                            "matchup": f"{away} @ {home}" if home and away else None,
+                            "market": market_key,
+                            "name": player_name,
+                            "bet_side": side,
+                            "book": book_key,
+                            "line": line,
+                            "odds": odds,
+                            "event_id": event_id,
+                        }
+                        rows.append(row)
+
+    payload = {"rows": rows, "meta": meta}
+    _cache_set(cache_key, payload)
+    return payload
+
+
+# ---------------------------
+# (Optional) stubs for future endpoints you showed in screenshots
+# ---------------------------
 
 @app.post("/props/model")
-def props_model(req: ModelReq):
-    """
-    Very simple baseline "model": add implied prob from offered odds,
-    optionally filter by min_odds, and surface a 'model_win_pct'.
-    (You can replace with a stronger model later.)
-    """
-    rows_out: List[Dict[str, Any]] = []
-    for r in req.rows:
-        odds = r.get("odds")
-        if req.min_odds is not None and isinstance(odds, int):
-            # Example filter: keep only odds >= min_odds if positive,
-            # or odds <= min_odds if negative; to keep it simple we skip here.
-            pass
+def props_model_stub():
+    return {"ok": True, "msg": "stub — implement later"}
 
-        p = american_to_prob(odds)
-        r2 = dict(r)
-        r2["model_win_pct"] = round(float(p) * 100.0, 2) if p is not None else None
-        rows_out.append(r2)
-
-    return {
-        "rows": rows_out,
-        "meta": {"count": len(rows_out)}
-    }
-
-
-def _pick_greedy_parlay(
-    rows: List[Dict[str, Any]],
-    size: int,
-    max_same_game: int,
-    max_per_player: int,
-    distinct_markets_only: bool
-) -> List[Dict[str, Any]]:
-    """
-    Simple greedy selector:
-    - Sort by model_win_pct descending (fallback to implied prob).
-    - Enforce constraints: same game cap, same player cap, distinct market if requested.
-    """
-    # Score rows
-    def score_row(r: Dict[str, Any]) -> float:
-        if r.get("model_win_pct") is not None:
-            return float(r["model_win_pct"])
-        p = american_to_prob(r.get("odds"))
-        return (p or 0.0) * 100.0
-
-    candidates = sorted(rows, key=score_row, reverse=True)
-
-    chosen: List[Dict[str, Any]] = []
-    by_game: Dict[str, int] = {}
-    by_player: Dict[str, int] = {}
-    markets_used: set = set()
-
-    for r in candidates:
-        if len(chosen) >= size:
-            break
-        eid = str(r.get("event_id"))
-        player = str(r.get("name"))
-        market = str(r.get("market"))
-
-        if max_same_game > 0 and by_game.get(eid, 0) >= max_same_game:
-            continue
-        if max_per_player > 0 and by_player.get(player, 0) >= max_per_player:
-            continue
-        if distinct_markets_only and market in markets_used:
-            continue
-
-        chosen.append(r)
-        by_game[eid] = by_game.get(eid, 0) + 1
-        by_player[player] = by_player.get(player, 0) + 1
-        markets_used.add(market)
-
-    return chosen
-
-
-@app.post("/parlay/suggest", response_model=ParlayResp)
-def parlay_suggest(req: ParlayReq):
-    picks = _pick_greedy_parlay(
-        rows=req.rows,
-        size=req.parlay_size,
-        max_same_game=req.max_same_game,
-        max_per_player=req.max_per_player,
-        distinct_markets_only=req.distinct_markets_only,
-    )
-    return {
-        "picks": picks,
-        "meta": {
-            "count": len(picks),
-            "parlay_size": req.parlay_size
-        }
-    }
-
+@app.post("/parlay/suggest")
+def parlay_suggest_stub():
+    return {"ok": True, "msg": "stub — implement later"}
 
 @app.post("/post/dubclub")
-def post_dubclub(req: DubReq):
-    """
-    Format a DubClub-ready text block. (No external call—just returns the string.)
-    """
-    lines = [req.header or "Props"]
-    for i, p in enumerate(req.picks, 1):
-        # Example line: "1) Mike Trout OVER 1.5 TB (-110) — DK"
-        who = p.get("name") or "Unknown"
-        side = p.get("bet_side") or ""
-        line = p.get("line")
-        market = p.get("market") or ""
-        odds = p.get("odds")
-        book = p.get("book") or ""
-        parts = [f"{i}) {who}"]
-        # Friendly market
-        if side:
-            parts.append(str(side).upper())
-        if line is not None:
-            parts.append(str(line))
-        if market:
-            parts.append(f"[{market}]")
-        if odds is not None:
-            parts.append(f"({odds})")
-        if book:
-            parts.append(f"— {book}")
-        lines.append(" ".join(parts))
-    if req.footer:
-        lines.append(req.footer)
-    return {"text": "\n".join(lines)}
+def post_dubclub_stub():
+    return {"ok": True, "msg": "stub — implement later"}
