@@ -267,3 +267,186 @@ def parlay_suggest_stub():
 @app.post("/post/dubclub")
 def post_dubclub_stub():
     return {"ok": True, "msg": "stub — implement later"}
+# ====== ENGINE: MLB score (market devig now; model hooks ready) =================
+from typing import List, Dict, Any, Union
+import requests
+
+class EngineScoreReq(BaseModel):
+    sports: Union[str, List[str]]
+    markets: Union[str, List[str]]
+    books: Union[str, List[str]]
+    regions: Union[str, List[str]] = "us"
+    cache_ttl_minutes: int = 2
+    force: bool = False
+    # thresholds (bettable/simple-view)
+    min_win_pct: float = 58.0
+    min_edge_pct: float = 2.0
+    min_odds: int = -250
+    max_odds: int = 800
+    top_per_event: int = 3
+    # blend weights (we’ll use these when we add a true model)
+    w_market: float = 0.7
+
+class EngineScoreOut(BaseModel):
+    rows: List[Dict[str, Any]]
+    meta: Dict[str, Any]
+
+def _aa_to_dec2(odds: int) -> float:
+    return 1 + (odds/100.0) if odds >= 0 else 1 + (100.0/abs(odds))
+
+def _impl_from_aa2(odds: int) -> float:
+    return 1.0 / _aa_to_dec2(odds)
+
+def _leg_base2(r: Dict[str, Any]) -> str:
+    # event + market + player + line (ignore book & side)
+    return "|".join([str(r.get("event_id","")), str(r.get("market","")),
+                     str(r.get("name","")), str(r.get("line",""))])
+
+def _devig_market_prob(rows: List[Dict[str, Any]]) -> None:
+    """
+    Adds to each row:
+      p_market (0..1)
+    Uses best Over vs Under on the same leg across books (de-vig).
+    """
+    best: Dict[str, Dict[str, int]] = {}  # base -> {'over':odds, 'under':odds}
+    for r in rows:
+        base = _leg_base2(r)
+        side = str(r.get("bet_side","")).lower()
+        bucket = best.get(base, {"over": None, "under": None})
+        if side == "over":
+            if bucket["over"] is None or _aa_to_dec2(r["odds"]) > _aa_to_dec2(bucket["over"]):
+                bucket["over"] = r["odds"]
+        else:
+            if bucket["under"] is None or _aa_to_dec2(r["odds"]) > _aa_to_dec2(bucket["under"]):
+                bucket["under"] = r["odds"]
+        best[base] = bucket
+
+    for r in rows:
+        base = _leg_base2(r)
+        bucket = best.get(base, {})
+        over_odds = bucket.get("over")
+        under_odds = bucket.get("under")
+
+        p_over_fair = None
+        if over_odds is not None and under_odds is not None:
+            p_over_raw = _impl_from_aa2(over_odds)
+            p_under_raw = _impl_from_aa2(under_odds)
+            denom = p_over_raw + p_under_raw
+            if denom > 0:
+                p_over_fair = p_over_raw / denom
+
+        if p_over_fair is None:
+            # fallback if we only have one side from the books
+            if over_odds is not None:
+                p_over_fair = _impl_from_aa2(over_odds)
+            elif under_odds is not None:
+                p_over_fair = 1 - _impl_from_aa2(under_odds)
+            else:
+                p_over_fair = 0.5
+
+        is_over = str(r.get("bet_side","")).lower() == "over"
+        r["p_market"] = p_over_fair if is_over else (1 - p_over_fair)
+
+def _keep_best_book_exact(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # exact identity includes side so we keep only the highest paying book per leg+side
+    seen: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        k = _leg_base2(r) + "|" + str(r.get("bet_side","")).lower()
+        prev = seen.get(k)
+        if prev is None or _aa_to_dec2(r["odds"]) > _aa_to_dec2(prev["odds"]):
+            seen[k] = r
+    return list(seen.values())
+
+@app.post("/engine/mlb/score", response_model=EngineScoreOut)
+def engine_mlb_score(req: EngineScoreReq):
+    """
+    Step 1 engine:
+      - pulls props via /props/raw
+      - computes p_market (de-vig)
+      - sets p_model = p_market (placeholder)
+      - p_final = p_market (blend scaffold in place)
+      - adds EV%, filters to bettable list
+    """
+    # normalize lists
+    def _as_list2(v): return v if isinstance(v, list) else [v]
+    sports  = _as_list2(req.sports)
+    markets = _as_list2(req.markets)
+    books   = _as_list2(req.books)
+    regions = _as_list2(req.regions)
+
+    # call our own /props/raw (reuses your cache & key)
+    base = os.environ.get("PUBLIC_BASE_URL", "").strip()
+    if not base:
+        # If you haven’t set PUBLIC_BASE_URL yet, try default Render URL pattern.
+        # Replace 'valuevault-api' if your service slug differs.
+        base = "https://valuevault-api.onrender.com"
+
+    payload = {
+        "sports": sports, "markets": markets, "books": books, "regions": regions,
+        "cache_ttl_minutes": req.cache_ttl_minutes, "force": req.force
+    }
+    try:
+        rr = requests.post(f"{base}/props/raw", json=payload, timeout=90)
+        if rr.status_code != 200:
+            raise HTTPException(status_code=rr.status_code, detail=f"/props/raw failed: {rr.text[:300]}")
+        rows = rr.json().get("rows", [])
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Error calling /props/raw: {e}")
+
+    if not rows:
+        return {"rows": [], "meta": {"input_rows": 0, "returned": 0, "hidden": 0}}
+
+    # market fair probability
+    _devig_market_prob(rows)
+
+    # model stub: for now mirror market; next step we will compute from MLB / weather
+    for r in rows:
+        r["p_model"] = r["p_market"]
+
+    # blend (scaffold): p_final = w_market * p_market + (1 - w_market) * p_model
+    w = max(0.0, min(1.0, req.w_market))
+    for r in rows:
+        p_final = w * r["p_market"] + (1 - w) * r["p_model"]
+        r["p_final"] = p_final
+        r["_win_prob"] = p_final
+        r["_roi"] = p_final * _aa_to_dec2(int(r["odds"])) - 1.0
+
+    # filter to bettable
+    def _in_odds_range(o: Any) -> bool:
+        try:
+            v = int(o); return req.min_odds <= v <= req.max_odds
+        except:
+            return False
+
+    filtered = [r for r in rows
+                if r["_win_prob"] >= (req.min_win_pct/100.0)
+                and r["_roi"] >= (req.min_edge_pct/100.0)
+                and _in_odds_range(r.get("odds"))]
+
+    # keep single best book per exact leg
+    filtered = _keep_best_book_exact(filtered)
+
+    # cap per event (keep the view tight)
+    if req.top_per_event and req.top_per_event > 0:
+        by_evt: Dict[str, List[Dict[str, Any]]] = {}
+        for r in filtered:
+            by_evt.setdefault(r.get("event_id",""), []).append(r)
+        capped: List[Dict[str, Any]] = []
+        for evt, lst in by_evt.items():
+            lst.sort(key=lambda x: (x["_roi"], x["_win_prob"]), reverse=True)
+            capped.extend(lst[:req.top_per_event])
+        filtered = capped
+
+    # final sort
+    filtered.sort(key=lambda x: (x["_roi"], x["_win_prob"]), reverse=True)
+
+    return {
+        "rows": filtered,
+        "meta": {
+            "input_rows": len(rows),
+            "returned": len(filtered),
+            "hidden": max(0, len(rows)-len(filtered)),
+            "note": "p_model currently mirrors p_market (placeholder). Next step: add MLB stats & weather."
+        }
+    }
+# ====== END ENGINE ============================================================
